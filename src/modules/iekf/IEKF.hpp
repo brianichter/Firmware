@@ -91,12 +91,15 @@ public:
 	void initializeAttitude(const sensor_combined_s *msg);
 	void predictState(const sensor_combined_s *msg);
 	void predictCovariance(const sensor_combined_s *msg);
+	void reconstructPosiiveP();
 	Vector<float, X::n> computeErrorCorrection(const Vector<float, Xe::n> &d_xe) const;
 	void correctionLogic(Vector<float, X::n> &dx) const;
 	void boundP();
 	void boundX();
 	void publish();
 	void normalizeQuaternion();
+	void stateSpaceParamUpdate();
+	void stateSpaceStateUpdate();
 
 	// sensor corrections/ callbacks
 	void correctAccel(const sensor_combined_s *msg);
@@ -121,7 +124,7 @@ public:
 	inline void incrementP(const SquareMatrix<float, Xe::n> &dP)
 	{
 		_P += dP;
-		// don't boundP here, too much cpu
+		boundP();
 	}
 	void setX(const Vector<float, X::n> &x)
 	{
@@ -314,6 +317,13 @@ private:
 	SquareMatrix<float, Xe::n> _dP; 	// change in covariance matrix used for checking
 	Vector<float, Innov::n>  _innov;
 	Vector<float, Innov::n>  _innovStd;
+	enum {
+		COV_STEP_AP = 0,
+		COV_STEP_PAT = 1,
+		COV_STEP_Q = 2,
+	};
+	uint8_t _covPredictStep;
+	float _covPredictDt;
 
 	// params
 	float _gyro_nd;

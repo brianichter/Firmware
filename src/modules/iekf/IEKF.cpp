@@ -103,6 +103,8 @@ IEKF::IEKF() :
 	_A(), _Q(), _dxe(), _dP(),
 	_innov(),
 	_innovStd(),
+	_covPredictStep(),
+	_covPredictDt(),
 	// params
 	_gyro_nd(0),
 	_gyro_rw_nd(0),
@@ -340,8 +342,8 @@ void IEKF::callbackImu(const sensor_combined_s *msg)
 	if (_attitudeInitialized) {
 
 		// predict driven by gyro callback
-		// deadline is 100 hz
-		uint64_t deadline = _stateTimestamp * 1e3 + 1e9 / 100;
+		// deadline is 250 hz
+		uint64_t deadline = _stateTimestamp * 1e3 + 1e9 / 200;
 
 		predictState(msg);
 
@@ -350,6 +352,9 @@ void IEKF::callbackImu(const sensor_combined_s *msg)
 			predictCovariance(msg);
 
 		} else {
+
+			stateSpaceStateUpdate();
+
 			// ~100 hz scheduling
 			if (_imuLowRateIndex % 2 == 0) {
 				correctLand(msg->timestamp);
@@ -432,6 +437,8 @@ void IEKF::updateParams()
 	_nh.getParam("IEKF_RATE_VISION", _sensorVision.getRateMax());
 	_nh.getParam("IEKF_RATE_MOCAP", _sensorMocap.getRateMax());
 	_nh.getParam("IEKF_RATE_LAND", _sensorLand.getRateMax());
+
+	stateSpaceParamUpdate();
 }
 
 void IEKF::callbackParamUpdate(const parameter_update_s *msg)
@@ -531,19 +538,19 @@ void IEKF::predictState(const sensor_combined_s *msg)
 	// integrate runge kutta 4th order
 	// TODO move rk4 algorithm to matrixlib
 	// https://en.wikipedia.org/wiki/Runge%E2%80%93Kutta_methods
-	float h = dt;
-	Vector<float, X::n> k1, k2, k3, k4;
-	k1 = dynamics(0, _x, _u);
-	k2 = dynamics(h / 2, _x + k1 * h / 2, _u);
-	k3 = dynamics(h / 2, _x + k2 * h / 2, _u);
-	k4 = dynamics(h, _x + k3 * h, _u);
-	Vector<float, X::n> dx = (k1 + k2 * 2 + k3 * 2 + k4) * (h / 6);
+	//float h = dt;
+	//Vector<float, X::n> k1, k2, k3, k4;
+	//k1 = dynamics(0, _x, _u);
+	//k2 = dynamics(h / 2, _x + k1 * h / 2, _u);
+	//k3 = dynamics(h / 2, _x + k2 * h / 2, _u);
+	//k4 = dynamics(h, _x + k3 * h, _u);
+	//Vector<float, X::n> dx = (k1 + k2 * 2 + k3 * 2 + k4) * (h / 6);
 
 	//ROS_INFO("dx predict \n");
 	//dx.print();
 
 	// euler integration
-	//Vector<float, X::n> dx = dynamics(0, _x, _u)*dt;
+	Vector<float, X::n> dx = dynamics(0, _x, _u) * dt;
 
 	incrementX(dx);
 }
@@ -556,155 +563,33 @@ void IEKF::predictCovariance(const sensor_combined_s *msg)
 		return;
 	}
 
-	float dt = (msg->timestamp - _covarianceTimestamp) / 1e6f;
-	_covarianceTimestamp = msg->timestamp;
+	if (_covPredictStep == COV_STEP_AP) {
+		_covPredictDt = (msg->timestamp - _covarianceTimestamp) / 1e6f;
+		_covarianceTimestamp = msg->timestamp;
 
-	// make sure dt is reasonable
-	if (dt < 0 || dt > 0.5f) {
+	}
+
+	if (_covPredictDt < 0 || _covPredictDt > 0.5f) {
 		return;
 	}
 
 	//ROS_INFO("predict covariance");
 
-	//ROS_INFO("ccelcovariance prediction rate period: %10.4g", double(dt));
-	Quatf q_nb = getQuaternionNB();
-
-	// rotation rate
-	Vector3f omega_nb_b_corrected = getAngularVelocityNBFrameB();
-
-	// define A matrix
-	{
-		_A.setZero();
-
-		// derivative of rotation error is -0.5 * gyro bias
-		_A(Xe::rot_N, Xe::Xe::gyro_bias_N) = -0.5;
-		_A(Xe::rot_E, Xe::Xe::gyro_bias_E) = -0.5;
-		_A(Xe::rot_D, Xe::Xe::gyro_bias_D) = -0.5;
-
-		// derivative of velocity
-		Vector3f a_b_corrected = getAccelerationFrameB();
-		Vector3f J_a_n = q_nb.conjugate(a_b_corrected);
-		Matrix<float, 3, 3> a_tmp = -J_a_n.hat() * 2;
-
-		for (int i = 0; i < 3; i++) {
-			for (int j = 0; j < 3; j++) {
-				_A(Xe::vel_N + i, Xe::rot_N + j) = a_tmp(i, j);
-			}
-
-			_A(Xe::vel_N + i, Xe::accel_bias_N + i) = -1.0f;
-		}
-
-		// derivative of gyro bias
-		Vector3f J_omega_n = q_nb.conjugate(omega_nb_b_corrected);
-		Matrix<float, 3, 3> g_tmp = J_omega_n.hat();
-
-		for (int i = 0; i < 3; i++) {
-			for (int j = 0; j < 3; j++) {
-				// this term isn't helpful, lets bias drift too much
-				//_A(Xe::gyro_bias_N + i, Xe::gyro_bias_N + j) = g_tmp(i, j);
-			}
-		}
-
-		// derivative of position is velocity
-		_A(Xe::pos_N, Xe::vel_N) = 1;
-		_A(Xe::pos_E, Xe::vel_E) = 1;
-		_A(Xe::asl, Xe::vel_D) = -1;
-
-		// derivative of terrain alt is zero
-
-		// derivative of baro bias
-		_A(Xe::baro_bias, Xe::baro_bias) = -1 / _baro_rw_ct;
-
-		// derivative of gyro bias
-		_A(Xe::gyro_bias_N, Xe::gyro_bias_N) = -1 / _gyro_rw_ct;
-		_A(Xe::gyro_bias_E, Xe::gyro_bias_E) = -1 / _gyro_rw_ct;
-		_A(Xe::gyro_bias_D, Xe::gyro_bias_D) = -1 / _gyro_rw_ct;
-
-		// derivative of accel bias
-		_A(Xe::accel_bias_N, Xe::accel_bias_N) = -1 / _accel_rw_ct;
-		_A(Xe::accel_bias_E, Xe::accel_bias_E) = -1 / _accel_rw_ct;
-		_A(Xe::accel_bias_D, Xe::accel_bias_D) = -1 / _accel_rw_ct;
-
-	}
-
-	// define process noise matrix
-	{
-		// variances
-		float accel_var_rw = _accel_rw_nd * _accel_rw_nd;
-		float gyro_var_rw = _gyro_rw_nd * _gyro_rw_nd;
-		float baro_var_rw = _baro_rw_nd * _baro_rw_nd;
-		float pos_var_xy = _pn_xy_nd * _pn_xy_nd;
-		float pos_var_z = _pn_z_nd * _pn_z_nd;
-		float rot_var = _gyro_nd * _gyro_nd +  \
-				_pn_rot_nd * _pn_rot_nd;
-		float vel_var_xy = _accel_nd * _accel_nd + \
-				   _pn_vxy_nd * _pn_vxy_nd;
-		float vel_var_z = _accel_nd * _accel_nd + \
-				  _pn_vz_nd * _pn_vz_nd;
-		float groundSpeedSq = getGroundVelocity().dot(getGroundVelocity());
-		float terrain_var_asl = _pn_t_asl_nd * _pn_t_asl_nd * groundSpeedSq;
-
-		// account for gyro saturation
-		if (getGyroSaturated()) {
-			rot_var *= 10;
-		}
-
-		// account for accel saturation
-		if (getAccelSaturated()) {
-			vel_var_z *= 10;
-			vel_var_xy *= 10;
-		}
-
-		_Q.setZero();
-		_Q(Xe::rot_N, Xe::rot_N) = rot_var;
-		_Q(Xe::rot_E, Xe::rot_E) = rot_var;
-		_Q(Xe::rot_D, Xe::rot_D) = rot_var;
-		_Q(Xe::vel_N, Xe::vel_N) = vel_var_xy;
-		_Q(Xe::vel_E, Xe::vel_E) = vel_var_xy;
-		_Q(Xe::vel_D, Xe::vel_D) = vel_var_z;
-		_Q(Xe::gyro_bias_N, Xe::gyro_bias_N) = gyro_var_rw;
-		_Q(Xe::gyro_bias_E, Xe::gyro_bias_E) = gyro_var_rw;
-		_Q(Xe::gyro_bias_D, Xe::gyro_bias_D) = gyro_var_rw;
-		_Q(Xe::accel_bias_N, Xe::accel_bias_N) = accel_var_rw;
-		_Q(Xe::accel_bias_E, Xe::accel_bias_E) = accel_var_rw;
-		_Q(Xe::accel_bias_D, Xe::accel_bias_D) = accel_var_rw;
-		_Q(Xe::pos_N, Xe::pos_N) = pos_var_xy;
-		_Q(Xe::pos_E, Xe::pos_E) = pos_var_xy;
-		_Q(Xe::asl, Xe::asl) = pos_var_z;
-		_Q(Xe::terrain_asl, Xe::terrain_asl) = terrain_var_asl;
-		_Q(Xe::baro_bias, Xe::baro_bias) = baro_var_rw;
-		//_Q(Xe::wind_N, Xe::wind_N) = 1e-2f;
-		//_Q(Xe::wind_E, Xe::wind_E) = 1e-2f;
-		//_Q(Xe::wind_D, Xe::wind_D) = 1e-2f;
-	}
-
-	//ROS_INFO("A:");
-	//for (int i=0;i<Xe::n; i++) {
-	//for (int j=0;j<Xe::n; j++) {
-	//printf("%10.3f, ", double(A(i, j)));
-	//}
-	//printf("\n");
-	//}
-
 	// propgate covariance using euler integration
-	// add term
-	// save stack space by doing this incrementally
+	// save stack space and cpu by doing this incrementally
 	// P+ = P- + (A*P- + P-*A^T + Q)*dt;
-	_dP = _A * _P;
-	_dP += _P * _A.T();
-	_dP += _Q;
-	incrementP(_dP * dt);
+	if (_covPredictStep == COV_STEP_AP) {
+		incrementP(_A * _P * _covPredictDt);
+		_covPredictStep++;
 
-	// force PSD using cholesky decomposition
-	// This decomposes the matrix into L * L.T
-	// then multiplies it back to zero.
-	// The matrix cholesky decomposition nulls
-	// any negative components in the decomposition.
-	// This isn't strickly the closest PSD matrix
-	// to P, but it does the job of keeping the small
-	// terms from going negative.
-	_P = cholesky(_P);
-	_P *= _P.T();
+	} else if (_covPredictStep == COV_STEP_PAT) {
+		incrementP(_P * _A.T() * _covPredictDt);
+		_covPredictStep++;
+
+	} else if (_covPredictStep == COV_STEP_AP) {
+		incrementP(_Q * _covPredictDt);
+		_covPredictStep = COV_STEP_AP;
+	}
 }
 
 Vector<float, X::n> IEKF::computeErrorCorrection(const Vector<float, Xe::n> &d_xe) const
@@ -846,13 +731,26 @@ void IEKF::boundP()
 
 		// force non-negative diagonal
 		if (_P(i, i) < 0) {
-			ROS_WARN("P(%d, %d) < 0, setting to P0 val", i, i, double(0));
-			_P(i, i) = _P0Diag(i);
+			ROS_WARN("P(%d, %d) < 0, setting to 0", i, i, double(0));
+			_P(i, i) = 0;
 
 			for (int k = 0; k < Xe::n; k++) {
 				_P(i, k) = 0;
 				_P(k, i) = 0;
 			}
+
+
+			// force PSD using cholesky decomposition
+			// This decomposes the matrix into L * L.T
+			// then multiplies it back to zero.
+			// The matrix cholesky decomposition nulls
+			// any negative components in the decomposition.
+			// This isn't strickly the closest PSD matrix
+			// to P, but it does the job of keeping the small
+			// terms from going negative.
+			//ROS_WARN("P(%d, %d) < 0, restructuring", i, i, double(0));
+			//_P = cholesky(_P);
+			//_P *= _P.T();
 		}
 
 		// force symmetry, copy uppper triangle to lower
@@ -1186,4 +1084,108 @@ void IEKF::normalizeQuaternion()
 	_x(X::q_nb_1) = q(1);
 	_x(X::q_nb_2) = q(2);
 	_x(X::q_nb_3) = q(3);
+}
+
+void IEKF::stateSpaceParamUpdate()
+{
+	//update A
+	{
+		// derivative of rotation error is -0.5 * gyro bias
+		_A(Xe::rot_N, Xe::Xe::gyro_bias_N) = -0.5;
+		_A(Xe::rot_E, Xe::Xe::gyro_bias_E) = -0.5;
+		_A(Xe::rot_D, Xe::Xe::gyro_bias_D) = -0.5;
+
+		// derivative of position is velocity
+		_A(Xe::pos_N, Xe::vel_N) = 1;
+		_A(Xe::pos_E, Xe::vel_E) = 1;
+		_A(Xe::asl, Xe::vel_D) = -1;
+
+		// derivative of terrain alt is zero
+
+		// derivative of baro bias
+		_A(Xe::baro_bias, Xe::baro_bias) = -1 / _baro_rw_ct;
+
+		// derivative of gyro bias
+		_A(Xe::gyro_bias_N, Xe::gyro_bias_N) = -1 / _gyro_rw_ct;
+		_A(Xe::gyro_bias_E, Xe::gyro_bias_E) = -1 / _gyro_rw_ct;
+		_A(Xe::gyro_bias_D, Xe::gyro_bias_D) = -1 / _gyro_rw_ct;
+
+		// derivative of accel bias
+		_A(Xe::accel_bias_N, Xe::accel_bias_N) = -1 / _accel_rw_ct;
+		_A(Xe::accel_bias_E, Xe::accel_bias_E) = -1 / _accel_rw_ct;
+		_A(Xe::accel_bias_D, Xe::accel_bias_D) = -1 / _accel_rw_ct;
+	}
+
+	// update Q
+	{
+		// variances
+		float accel_var_rw = _accel_rw_nd * _accel_rw_nd;
+		float gyro_var_rw = _gyro_rw_nd * _gyro_rw_nd;
+		float baro_var_rw = _baro_rw_nd * _baro_rw_nd;
+		float pos_var_xy = _pn_xy_nd * _pn_xy_nd;
+		float pos_var_z = _pn_z_nd * _pn_z_nd;
+		float rot_var = _gyro_nd * _gyro_nd +  \
+				_pn_rot_nd * _pn_rot_nd;
+		float vel_var_xy = _accel_nd * _accel_nd + \
+				   _pn_vxy_nd * _pn_vxy_nd;
+		float vel_var_z = _accel_nd * _accel_nd + \
+				  _pn_vz_nd * _pn_vz_nd;
+		float groundSpeedSq = getGroundVelocity().dot(getGroundVelocity());
+		float terrain_var_asl = _pn_t_asl_nd * _pn_t_asl_nd * groundSpeedSq;
+
+		_Q(Xe::rot_N, Xe::rot_N) = rot_var;
+		_Q(Xe::rot_E, Xe::rot_E) = rot_var;
+		_Q(Xe::rot_D, Xe::rot_D) = rot_var;
+		_Q(Xe::vel_N, Xe::vel_N) = vel_var_xy;
+		_Q(Xe::vel_E, Xe::vel_E) = vel_var_xy;
+		_Q(Xe::vel_D, Xe::vel_D) = vel_var_z;
+		_Q(Xe::gyro_bias_N, Xe::gyro_bias_N) = gyro_var_rw;
+		_Q(Xe::gyro_bias_E, Xe::gyro_bias_E) = gyro_var_rw;
+		_Q(Xe::gyro_bias_D, Xe::gyro_bias_D) = gyro_var_rw;
+		_Q(Xe::accel_bias_N, Xe::accel_bias_N) = accel_var_rw;
+		_Q(Xe::accel_bias_E, Xe::accel_bias_E) = accel_var_rw;
+		_Q(Xe::accel_bias_D, Xe::accel_bias_D) = accel_var_rw;
+		_Q(Xe::pos_N, Xe::pos_N) = pos_var_xy;
+		_Q(Xe::pos_E, Xe::pos_E) = pos_var_xy;
+		_Q(Xe::asl, Xe::asl) = pos_var_z;
+		_Q(Xe::terrain_asl, Xe::terrain_asl) = terrain_var_asl;
+		_Q(Xe::baro_bias, Xe::baro_bias) = baro_var_rw;
+		//_Q(Xe::wind_N, Xe::wind_N) = 1e-2f;
+		//_Q(Xe::wind_E, Xe::wind_E) = 1e-2f;
+		//_Q(Xe::wind_D, Xe::wind_D) = 1e-2f;
+	}
+}
+
+void IEKF::stateSpaceStateUpdate()
+{
+	//ROS_INFO("ccelcovariance prediction rate period: %10.4g", double(dt));
+	Quatf q_nb = getQuaternionNB();
+
+	// rotation rate
+	Vector3f omega_nb_b_corrected = getAngularVelocityNBFrameB();
+
+
+	// derivative of velocity
+	Vector3f a_b_corrected = getAccelerationFrameB();
+	Vector3f J_a_n = q_nb.conjugate(a_b_corrected);
+	Matrix<float, 3, 3> a_tmp = -J_a_n.hat() * 2;
+
+	for (int i = 0; i < 3; i++) {
+		for (int j = 0; j < 3; j++) {
+			_A(Xe::vel_N + i, Xe::rot_N + j) = a_tmp(i, j);
+		}
+
+		_A(Xe::vel_N + i, Xe::accel_bias_N + i) = -1.0f;
+	}
+
+	// derivative of gyro bias
+	Vector3f J_omega_n = q_nb.conjugate(omega_nb_b_corrected);
+	Matrix<float, 3, 3> g_tmp = J_omega_n.hat();
+
+	for (int i = 0; i < 3; i++) {
+		for (int j = 0; j < 3; j++) {
+			// this term isn't helpful, lets bias drift too much
+			//_A(Xe::gyro_bias_N + i, Xe::gyro_bias_N + j) = g_tmp(i, j);
+		}
+	}
 }
